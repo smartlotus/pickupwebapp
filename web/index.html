@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base href="$FLUTTER_BASE_HREF">
+
+  <meta charset="UTF-8">
+  <meta content="IE=Edge" http-equiv="X-UA-Compatible">
+  <meta name="description" content="Pickup PWA: capture memories, tracks, and AI reflections.">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#121212">
+  <meta name="format-detection" content="telephone=no">
+
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Pickup">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+
+  <link rel="icon" type="image/png" href="favicon.png"/>
+  <link rel="manifest" href="manifest.json">
+  <link rel="preload" href="MaterialIcons-Regular.otf" as="font" type="font/otf" crossorigin>
+  <link rel="preload" href="assets/fonts/MaterialIcons-Regular.otf" as="font" type="font/otf" crossorigin>
+  <style>
+    @font-face {
+      font-family: "MaterialIcons";
+      src: url("MaterialIcons-Regular.otf") format("opentype"),
+           url("assets/fonts/MaterialIcons-Regular.otf") format("opentype");
+      font-style: normal;
+      font-weight: 400;
+    }
+  </style>
+  <title>Pickup</title>
+</head>
+<body>
+  <div id="file-protocol-warning" style="display:none;max-width:680px;margin:40px auto;padding:20px;border-radius:12px;background:#1e1e1e;color:#f0f0f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;line-height:1.6;">
+    <h2 style="margin-top:0;color:#ffffff;">Pickup cannot run from a local file path</h2>
+    <p style="color:#c9c9c9;">You opened this page with <code>file://</code>. Flutter Web requires an HTTP/HTTPS server.</p>
+    <p style="color:#c9c9c9;">Use one of these commands in the project folder:</p>
+    <pre style="white-space:pre-wrap;background:#121212;padding:12px;border-radius:8px;color:#a8e6cf;">powershell -ExecutionPolicy Bypass -File scripts\serve_pwa_local.ps1
+python -m http.server 8787 --directory build/web</pre>
+    <p style="color:#c9c9c9;">Then open: <strong>http://127.0.0.1:8787</strong></p>
+  </div>
+  <script>
+    (function () {
+      if (window.location.protocol === 'file:') {
+        var warning = document.getElementById('file-protocol-warning');
+        if (warning) {
+          warning.style.display = 'block';
+        }
+        document.body.style.background = '#121212';
+        return;
+      }
+      var script = document.createElement('script');
+      script.src = 'flutter_bootstrap.js';
+      script.async = true;
+      document.body.appendChild(script);
+    })();
+  </script>
+</body>
+</html>
