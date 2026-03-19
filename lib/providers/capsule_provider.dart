@@ -1,4 +1,5 @@
 ﻿import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -403,6 +404,113 @@ class CapsuleProvider extends ChangeNotifier {
     'ai_progress_finalizing': '整理答案',
     'ai_progress_done': '完成',
   };
+
+  bool _isGeminiConfig(String baseUrl, String modelName) {
+    return baseUrl.contains('generativelanguage.googleapis.com') &&
+        modelName.toLowerCase().contains('gemini');
+  }
+
+  String _normalizeOpenAiCompatibleUrl(String rawUrl) {
+    var urlStr = rawUrl.trim();
+    if (!urlStr.endsWith('/chat/completions') && !urlStr.endsWith('/v1')) {
+      urlStr = urlStr.endsWith('/')
+          ? '${urlStr}v1/chat/completions'
+          : '$urlStr/v1/chat/completions';
+    } else if (urlStr.endsWith('/v1')) {
+      urlStr = '$urlStr/chat/completions';
+    }
+    return urlStr;
+  }
+
+  String _buildGeminiGenerateContentUrl(String baseUrl, String modelName) {
+    var urlStr = baseUrl.trim().isEmpty
+        ? 'https://generativelanguage.googleapis.com'
+        : baseUrl.trim();
+    if (urlStr.contains(':generateContent')) {
+      return urlStr;
+    }
+    if (urlStr.endsWith('/')) {
+      urlStr = urlStr.substring(0, urlStr.length - 1);
+    }
+    if (!urlStr.contains('/v1')) {
+      urlStr = '$urlStr/v1beta';
+    }
+    if (urlStr.endsWith('/models')) {
+      return '$urlStr/$modelName:generateContent';
+    }
+    if (urlStr.contains('/models/')) {
+      return '$urlStr:generateContent';
+    }
+    return '$urlStr/models/$modelName:generateContent';
+  }
+
+  Future<http.Response> _postJsonWithWebProxyFallback({
+    required String url,
+    required Map<String, String> headers,
+    required Map<String, dynamic> body,
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    final encodedBody = jsonEncode(body);
+
+    if (kIsWeb) {
+      try {
+        final proxyResponse = await http
+            .post(
+              Uri.parse('/api/ai-proxy'),
+              headers: const {'Content-Type': 'application/json'},
+              body: jsonEncode({
+                'url': url,
+                'headers': headers,
+                'body': body,
+              }),
+            )
+            .timeout(timeout);
+
+        // If proxy exists, use it directly.
+        if (proxyResponse.statusCode != 404 &&
+            proxyResponse.statusCode != 405 &&
+            proxyResponse.statusCode != 501) {
+          return proxyResponse;
+        }
+      } catch (e) {
+        debugPrint('Proxy request failed, fallback to direct request: $e');
+      }
+    }
+
+    return http
+        .post(
+          Uri.parse(url),
+          headers: headers,
+          body: encodedBody,
+        )
+        .timeout(timeout);
+  }
+
+  String _extractGeminiText(Map<String, dynamic> jsonResp) {
+    final candidates = jsonResp['candidates'];
+    if (candidates is! List || candidates.isEmpty) {
+      return '';
+    }
+    final firstCandidate = candidates.first;
+    if (firstCandidate is! Map) {
+      return '';
+    }
+    final content = firstCandidate['content'];
+    if (content is! Map) {
+      return '';
+    }
+    final parts = content['parts'];
+    if (parts is! List || parts.isEmpty) {
+      return '';
+    }
+    final firstPart = parts.first;
+    if (firstPart is! Map) {
+      return '';
+    }
+    final text = firstPart['text'];
+    return text is String ? text.trim() : '';
+  }
+
   Future<String> analyzeDateRange(DateTime start, DateTime end) async {
     if (_apiKey == null || _apiKey!.isEmpty) {
       return t('ai_offline_key');
@@ -445,54 +553,77 @@ class CapsuleProvider extends ChangeNotifier {
     final prompt = "You are an empathetic psychological time-travel assistant. Here are my diary entries and later self-reflections from $startDateStr to $endDateStr. Please provide a comprehensive, beautifully written summary of my overall mood, recurring themes, and warm concluding advice based on both my original entries and my later thoughts.\n\nEntries:\n${sb.toString()}";
 
     try {
-      // Unified API Adapter logic
-      if (_apiBaseUrl.contains('generativelanguage.googleapis.com') && _apiModelName.contains('gemini')) {
-        // Native Gemini SDK
-        final model = GenerativeModel(
-          model: _apiModelName,
-          apiKey: _apiKey!,
-        );
-        final response = await model.generateContent([Content.text(prompt)]);
-        final resText = response.text?.trim() ?? t('ai_analysis_empty');
-        _addAiEntry(AiEntry(id: const Uuid().v4(), question: analysisQuestion, answer: resText, type: AiEntryType.summary, timestamp: DateTime.now()));
-        return resText;
-      } else {
-        // OpenAI-Compatible Format Adapter
-        // Automatically append /v1/chat/completions if missing and not explicitly configured
-        String urlStr = _apiBaseUrl;
-        if (!urlStr.endsWith('/chat/completions') && !urlStr.endsWith('/v1')) {
-          urlStr = urlStr.endsWith('/') ? '${urlStr}v1/chat/completions' : '$urlStr/v1/chat/completions';
-        } else if (urlStr.endsWith('/v1')) {
-          urlStr = '$urlStr/chat/completions';
+      if (_isGeminiConfig(_apiBaseUrl, _apiModelName)) {
+        if (!kIsWeb) {
+          // Mobile/Desktop keeps native SDK path.
+          final model = GenerativeModel(
+            model: _apiModelName,
+            apiKey: _apiKey!,
+          );
+          final response = await model.generateContent([Content.text(prompt)]);
+          final resText = response.text?.trim() ?? t('ai_analysis_empty');
+          _addAiEntry(AiEntry(id: const Uuid().v4(), question: analysisQuestion, answer: resText, type: AiEntryType.summary, timestamp: DateTime.now()));
+          return resText;
         }
 
-        final response = await http.post(
-          Uri.parse(urlStr),
+        // Web uses REST + same-origin proxy fallback to avoid browser CORS blocks.
+        final urlStr = _buildGeminiGenerateContentUrl(_apiBaseUrl, _apiModelName);
+        final response = await _postJsonWithWebProxyFallback(
+          url: urlStr,
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': 'Bearer $_apiKey',
+            'x-goog-api-key': _apiKey!,
           },
-          body: jsonEncode({
-            "model": _apiModelName,
-            "messages": [
-              {"role": "user", "content": prompt}
-            ],
-          }),
+          body: {
+            'contents': [
+              {
+                'parts': [
+                  {'text': prompt}
+                ]
+              }
+            ]
+          },
         );
 
         if (response.statusCode == 200) {
-          final jsonResp = jsonDecode(utf8.decode(response.bodyBytes));
-          final resText = jsonResp['choices']?[0]?['message']?['content']?.trim() ?? t('ai_analysis_bad_format');
-          _addAiEntry(AiEntry(id: const Uuid().v4(), question: analysisQuestion, answer: resText, type: AiEntryType.summary, timestamp: DateTime.now()));
-          return resText;
-        } else {
-          debugPrint('HTTP Error: ${response.statusCode} - ${response.body}');
-          return tf('ai_http_error', {'code': response.statusCode.toString()});
+          final jsonResp = jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>;
+          final resText = _extractGeminiText(jsonResp);
+          final finalText = resText.isEmpty ? t('ai_analysis_bad_format') : resText;
+          _addAiEntry(AiEntry(id: const Uuid().v4(), question: analysisQuestion, answer: finalText, type: AiEntryType.summary, timestamp: DateTime.now()));
+          return finalText;
         }
+
+        debugPrint('Gemini HTTP Error: ${response.statusCode} - ${response.body}');
+        return tf('ai_http_error', {'code': response.statusCode.toString()});
       }
+
+      final urlStr = _normalizeOpenAiCompatibleUrl(_apiBaseUrl);
+      final response = await _postJsonWithWebProxyFallback(
+        url: urlStr,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $_apiKey',
+        },
+        body: {
+          'model': _apiModelName,
+          'messages': [
+            {'role': 'user', 'content': prompt}
+          ],
+        },
+      );
+
+      if (response.statusCode == 200) {
+        final jsonResp = jsonDecode(utf8.decode(response.bodyBytes));
+        final resText = jsonResp['choices']?[0]?['message']?['content']?.trim() ?? t('ai_analysis_bad_format');
+        _addAiEntry(AiEntry(id: const Uuid().v4(), question: analysisQuestion, answer: resText, type: AiEntryType.summary, timestamp: DateTime.now()));
+        return resText;
+      }
+
+      debugPrint('HTTP Error: ${response.statusCode} - ${response.body}');
+      return tf('ai_http_error', {'code': response.statusCode.toString()});
     } catch (e) {
       debugPrint('AI generation error: $e');
-      return t('ai_offline_network');
+      return tf('api_error', {'error': e.toString()});
     }
   }
 
@@ -522,46 +653,70 @@ class CapsuleProvider extends ChangeNotifier {
     final prompt = "Today is $todayStr. You are my memory assistant. Based on my diary context below, please answer my question accurately and conversationally. Do not make up information that is not in the diary.\n\nMy Question: $question\n\nDiary Context:\n${sb.toString()}";
 
     try {
-      if (_apiBaseUrl.contains('generativelanguage.googleapis.com') && _apiModelName.contains('gemini')) {
-        final model = GenerativeModel(model: _apiModelName, apiKey: _apiKey!);
-        final response = await model.generateContent([Content.text(prompt)]);
-        final resText = response.text?.trim() ?? t('ai_analysis_empty');
-        _addAiEntry(AiEntry(id: const Uuid().v4(), question: question, answer: resText, type: AiEntryType.recall, timestamp: DateTime.now()));
-        return resText;
-      } else {
-        String urlStr = _apiBaseUrl;
-        if (!urlStr.endsWith('/chat/completions') && !urlStr.endsWith('/v1')) {
-          urlStr = urlStr.endsWith('/') ? '${urlStr}v1/chat/completions' : '$urlStr/v1/chat/completions';
-        } else if (urlStr.endsWith('/v1')) {
-          urlStr = '$urlStr/chat/completions';
+      if (_isGeminiConfig(_apiBaseUrl, _apiModelName)) {
+        if (!kIsWeb) {
+          final model = GenerativeModel(model: _apiModelName, apiKey: _apiKey!);
+          final response = await model.generateContent([Content.text(prompt)]);
+          final resText = response.text?.trim() ?? t('ai_analysis_empty');
+          _addAiEntry(AiEntry(id: const Uuid().v4(), question: question, answer: resText, type: AiEntryType.recall, timestamp: DateTime.now()));
+          return resText;
         }
 
-        final response = await http.post(
-          Uri.parse(urlStr),
+        final urlStr = _buildGeminiGenerateContentUrl(_apiBaseUrl, _apiModelName);
+        final response = await _postJsonWithWebProxyFallback(
+          url: urlStr,
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': 'Bearer $_apiKey',
+            'x-goog-api-key': _apiKey!,
           },
-          body: jsonEncode({
-            "model": _apiModelName,
-            "messages": [
-              {"role": "user", "content": prompt}
-            ],
-          }),
+          body: {
+            'contents': [
+              {
+                'parts': [
+                  {'text': prompt}
+                ]
+              }
+            ]
+          },
         );
 
         if (response.statusCode == 200) {
-          final jsonResp = jsonDecode(utf8.decode(response.bodyBytes));
-          final resText = jsonResp['choices']?[0]?['message']?['content']?.trim() ?? t('ai_analysis_bad_format');
-          _addAiEntry(AiEntry(id: const Uuid().v4(), question: question, answer: resText, type: AiEntryType.recall, timestamp: DateTime.now()));
-          return resText;
-        } else {
-          return tf('ai_api_error', {'code': response.statusCode.toString()});
+          final jsonResp = jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>;
+          final resText = _extractGeminiText(jsonResp);
+          final finalText = resText.isEmpty ? t('ai_analysis_bad_format') : resText;
+          _addAiEntry(AiEntry(id: const Uuid().v4(), question: question, answer: finalText, type: AiEntryType.recall, timestamp: DateTime.now()));
+          return finalText;
         }
+
+        return tf('ai_api_error', {'code': response.statusCode.toString()});
       }
+
+      final urlStr = _normalizeOpenAiCompatibleUrl(_apiBaseUrl);
+      final response = await _postJsonWithWebProxyFallback(
+        url: urlStr,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $_apiKey',
+        },
+        body: {
+          'model': _apiModelName,
+          'messages': [
+            {'role': 'user', 'content': prompt}
+          ],
+        },
+      );
+
+      if (response.statusCode == 200) {
+        final jsonResp = jsonDecode(utf8.decode(response.bodyBytes));
+        final resText = jsonResp['choices']?[0]?['message']?['content']?.trim() ?? t('ai_analysis_bad_format');
+        _addAiEntry(AiEntry(id: const Uuid().v4(), question: question, answer: resText, type: AiEntryType.recall, timestamp: DateTime.now()));
+        return resText;
+      }
+
+      return tf('ai_api_error', {'code': response.statusCode.toString()});
     } catch (e) {
       debugPrint('AI Chat Error: $e');
-      return t('ai_connection_failed');
+      return tf('api_error', {'error': e.toString()});
     }
   }
 
@@ -570,42 +725,69 @@ class CapsuleProvider extends ChangeNotifier {
     
     try {
       final prompt = "Hello! Please reply ONLY with the text: OK";
-      if (testUrl.contains('generativelanguage.googleapis.com') && testModel.contains('gemini')) {
-        final model = GenerativeModel(model: testModel, apiKey: testKey.trim());
-        final response = await model.generateContent([Content.text(prompt)]);
-        return tf('api_ok', {'text': response.text?.trim() ?? 'OK'});
-      } else {
-        String urlStr = testUrl.trim();
-        if (!urlStr.endsWith('/chat/completions') && !urlStr.endsWith('/v1')) {
-          urlStr = urlStr.endsWith('/') ? '${urlStr}v1/chat/completions' : '$urlStr/v1/chat/completions';
-        } else if (urlStr.endsWith('/v1')) {
-          urlStr = '$urlStr/chat/completions';
+      if (_isGeminiConfig(testUrl, testModel)) {
+        if (!kIsWeb) {
+          final model = GenerativeModel(model: testModel, apiKey: testKey.trim());
+          final response = await model.generateContent([Content.text(prompt)]);
+          return tf('api_ok', {'text': response.text?.trim() ?? 'OK'});
         }
 
-        final response = await http.post(
-          Uri.parse(urlStr),
+        final urlStr = _buildGeminiGenerateContentUrl(testUrl, testModel);
+        final response = await _postJsonWithWebProxyFallback(
+          url: urlStr,
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': 'Bearer ${testKey.trim()}',
+            'x-goog-api-key': testKey.trim(),
           },
-          body: jsonEncode({
-            "model": testModel.trim(),
-            "messages": [
-              {"role": "user", "content": prompt}
-            ],
-            "max_tokens": 10,
-          }),
-        ).timeout(const Duration(seconds: 15));
+          body: {
+            'contents': [
+              {
+                'parts': [
+                  {'text': prompt}
+                ]
+              }
+            ]
+          },
+          timeout: const Duration(seconds: 15),
+        );
 
         if (response.statusCode == 200) {
-          return t('api_ok_target');
-        } else {
-          return tf('api_fail', {
-            'code': response.statusCode.toString(),
-            'detail': response.body,
-          });
+          final jsonResp = jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>;
+          final text = _extractGeminiText(jsonResp);
+          return tf('api_ok', {'text': text.isEmpty ? 'OK' : text});
         }
+
+        return tf('api_fail', {
+          'code': response.statusCode.toString(),
+          'detail': response.body,
+        });
       }
+
+      final urlStr = _normalizeOpenAiCompatibleUrl(testUrl.trim());
+      final response = await _postJsonWithWebProxyFallback(
+        url: urlStr,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ${testKey.trim()}',
+        },
+        body: {
+          'model': testModel.trim(),
+          'messages': [
+            {'role': 'user', 'content': prompt}
+          ],
+          'max_tokens': 10,
+        },
+        timeout: const Duration(seconds: 15),
+      );
+
+      if (response.statusCode == 200) {
+        return t('api_ok_target');
+      }
+
+      return tf('api_fail', {
+        'code': response.statusCode.toString(),
+        'detail': response.body,
+      });
     } catch (e) {
       return tf('api_error', {'error': e.toString()});
     }
